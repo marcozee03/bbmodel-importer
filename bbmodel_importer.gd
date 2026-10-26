@@ -139,7 +139,7 @@ class Tex:
 			var img = ImageTexture.new()
 			img.resource_name = embedded_image.resource_name
 			img.set_image(embedded_image)
-			return
+			return img
 		return null
 
 

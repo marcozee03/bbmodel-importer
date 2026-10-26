@@ -1,7 +1,7 @@
 @tool
 extends EditorPlugin
 
-const BBModelImporter = preload("res://addons/bbmodel/bbmodel_importer.gd")
+const BBModelImporter = preload("res://addons/bbmodel-importer/bbmodel_importer.gd")
 
 var _importer: EditorSceneFormatImporter
 
