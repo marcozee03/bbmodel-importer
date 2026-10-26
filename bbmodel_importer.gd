@@ -19,16 +19,154 @@ const SKIP_FACE := -2
 
 
 ## Per-import state, so the importer instance itself stays stateless.
+class Tex:
+	var texture: Texture2D
+	var material: Material
+	var uv_size: Vector2
+
+
+	func _init(texture: Texture2D, material: Material, uv_size: Vector2) -> void:
+		self.texture = texture
+		self.material = material
+		self.uv_size = uv_size
+
+
+	static func from_bbtexture(ctx: Ctx, texture: BBTexture) -> Tex:
+		var tex := _load_texture_image(ctx, texture)
+		var uv_size := texture.uv_size
+
+		var mat_name := texture.name
+		if (mat_name.is_empty()):
+			mat_name = "texture_%s" % texture.id
+		var material = _make_material(
+			tex,
+			mat_name,
+			ctx.nearest,
+			texture.render_mode,
+			texture.render_sides,
+		)
+		return Tex.new(tex, material, uv_size)
+
+
+	static func _make_material(
+		tex: Texture2D,
+		mat_name: String,
+		nearest: bool,
+		render_mode: String,
+		render_sides: String,
+	) -> StandardMaterial3D:
+		var mat := StandardMaterial3D.new()
+		mat.resource_name = mat_name
+		if tex != null:
+			mat.albedo_texture = tex
+			match render_mode:
+				"default":
+					mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
+				"emissive":
+					mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
+					mat.emission_enabled = true
+					mat.emission = Color.WHITE
+				"additive":
+					mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+			match render_sides:
+				"auto":
+					mat.cull_mode = BaseMaterial3D.CULL_BACK
+				"front":
+					mat.cull_mode = BaseMaterial3D.CULL_BACK
+					push_warning("do not currently support emissive textures")
+				"double":
+					mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+
+			if nearest:
+				mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		else:
+			mat.albedo_color = Color(0.8, 0.8, 0.8)
+		return mat
+
+
+	static func _load_texture_image(ctx: Ctx, tex: BBTexture) -> Texture2D:
+		# 2. External file next to the .bbmodel.
+		assert(
+			ctx.texture_extraction != _HandleBinaryImageMode.EXTRACT_TEXTURES,
+			"Extract Textures not yet supported",
+		)
+		if ctx.texture_extraction == _HandleBinaryImageMode.DISCARD_TEXTURES:
+			return null
+		var local_path = ProjectSettings.localize_path(ctx.base_dir.path_join(tex.relative_path))
+		var local_texture := _load_texture_from_path(local_path)
+		if local_texture != null:
+			return local_texture
+
+		var abs_path: String = ProjectSettings.localize_path(str(tex.path))
+		var abs_texture := _load_texture_from_path(abs_path)
+		if abs_texture != null:
+			return abs_texture
+
+		var embedded_image := tex._get_image()
+		if embedded_image != null:
+			match ctx.texture_extraction:
+				_HandleBinaryImageMode.EXTRACT_TEXTURES:
+					if ctx.base_dir.is_empty():
+						push_warning(
+							"bbmodel: Couldn't extract image because the base and extract paths are empty. It will be loaded directly instead, uncompressed."
+						)
+					elif ctx.base_dir.begins_with("res://.godot/imported"):
+						push_warning(
+							"bbmodel: Extract path is in the imported directory. Image will be loaded directly, uncompressed."
+						)
+					else:
+						if embedded_image.resource_name.is_empty():
+							push_warning(
+								"glTF: Image index '%d' did not have a name. It will be automatically given a name based on its index.",
+								tex.get("id"),
+							)
+							embedded_image.resource_name = tex.get("id")
+						var must_write := true
+						var must_import := true
+						var image_data := embedded_image.get_data()
+						var generator_parameters: Dictionary
+						var file_path: String
+
+				_HandleBinaryImageMode.EMBED_AS_BASISU:
+					var texture := PortableCompressedTexture2D.new()
+					texture.resource_name = embedded_image.resource_name
+					texture.set_keep_all_compressed_buffers(true)
+					texture.create_from_image(
+						embedded_image,
+						PortableCompressedTexture2D.COMPRESSION_MODE_BASIS_UNIVERSAL,
+					)
+					return texture
+			var img = ImageTexture.new()
+			img.resource_name = embedded_image.resource_name
+			img.set_image(embedded_image)
+			return
+		return null
+
+
+	static func _load_texture_from_path(path: String) -> Texture2D:
+		var localized_path = ProjectSettings.localize_path(ProjectSettings.globalize_path(path))
+		if ResourceLoader.exists(localized_path):
+			var tex := ResourceLoader.load(localized_path)
+			if tex != null:
+				return tex
+		elif FileAccess.file_exists(localized_path):
+			var img := Image.load_from_file(ProjectSettings.globalize_path(path))
+			if img != null and not img.is_empty():
+				return ImageTexture.create_from_image(img)
+		return null
+
+
 class Ctx:
+	var state: BBState
 	var scale := 1.0 / 16.0
+	var base_dir: String = ""
 	var nodes: Dictionary[String, Node3D] = { } # uuid -> built node
 	var root: Node3D
-	var resolution: Vector2 = Vector2(16, 16)
-	var elements: Dictionary[String, Dictionary] = { } # uuid -> element Dictionary
 	var used: Dictionary[String, bool] = { } # uuid -> true (elements placed via the outliner)
-	var materials: Dictionary[int, Material] = { } # texture index (or DEFAULT_MATERIAL) -> Material
-	var uv_sizes: Dictionary[int, Vector2] = { } # texture index (or DEFAULT_MATERIAL) -> Vector2
-	var tex_ids: Array[String] = []
+	var textures: Array[Tex] = []
+	var nearest: bool
+	var default_material: Tex
+	var texture_extraction: _HandleBinaryImageMode = _HandleBinaryImageMode.EMBED_AS_BASISU
 
 # --------------------------------------------------------------------------------------
 # EditorSceneFormatImporter API
@@ -40,10 +178,20 @@ func _get_extensions() -> PackedStringArray:
 
 
 const BBAnimations := preload("bbmodel_animation.gd")
+const BBState := preload("bbstate.gd")
+const BBTexture := preload("bbtexture.gd")
 
 
 func _get_import_flags() -> int:
 	return IMPORT_SCENE | IMPORT_ANIMATION
+
+
+enum _HandleBinaryImageMode {
+	DISCARD_TEXTURES,
+	EXTRACT_TEXTURES,
+	EMBED_AS_BASISU,
+	EMBED_AS_UNCOMPRESSED, # If this value changes from 3, ResourceImporterScene::pre_import must be changed as well.
+}
 
 
 func _get_import_options(path: String) -> void:
@@ -51,72 +199,14 @@ func _get_import_options(path: String) -> void:
 		add_import_option("bbmodel/pixels_per_unit", 16.0)
 		add_import_option("bbmodel/nearest_filter", true)
 		add_import_option("bbmodel/animation_fps", 30.0)
-
-
-func version_less(version_a: String, version_b: String) -> bool:
-	var major_a: int = version_a.get_slice(".", 0).to_int()
-	var minor_a: int = version_a.get_slice(".", 1).to_int()
-	var major_b: int = version_b.get_slice(".", 0).to_int()
-	var minor_b: int = version_b.get_slice(".", 1).to_int()
-	if major_a == major_b:
-		return minor_a < minor_b
-	else:
-		return major_a < major_b
-
-
-func version_greater(version_a: String, version_b: String) -> bool:
-	var major_a: int = version_a.get_slice(".", 0).to_int()
-	var minor_a: int = version_a.get_slice(".", 1).to_int()
-	var major_b: int = version_b.get_slice(".", 0).to_int()
-	var minor_b: int = version_b.get_slice(".", 1).to_int()
-	if major_a == major_b:
-		return minor_a > minor_b
-	else:
-		return major_a > major_b
-
-
-func fix_outliner(list: Array) -> void:
-	for child in list:
-		if typeof(child) == TYPE_DICTIONARY:
-			var dict: Dictionary = child
-			fix_outliner(dict["children"])
-			if dict.has("rotation"):
-				var rotation: Array = dict["rotation"]
-				rotation[2] *= -1
-
-
-func process_compatibility(model: Dictionary) -> Dictionary:
-	var meta: Dictionary = model["meta"]
-	if not meta.has("model_format"):
-		if meta.get("bone_rig", false):
-			meta["model_format"] = "bedrock_old"
-		else:
-			meta["model_format"] = "java_block"
-
-	if model.has("cubes") and !model.has("elements"):
-		model["elements"] = model["cubes"]
-
-	if model.has("geometry_name"):
-		model["model_identifier"] = model["geometry_name"]
-
-	if (
-		not model.get("elements", []).is_empty() and meta["box_uv"]
-		and version_less(meta["format_version"], "4.5")
-	):
-		for element in model["elements"]:
-			if not element.get("shade", true):
-				element["mirror_uv"] = true
-
-	if model.has("outliner") and version_less(meta["format_version"], "3.2"):
-		fix_outliner(model["outliner"])
-	#TODO: textures backwards compatibility https://github.com/JannisX11/blockbench/blob/ec0b2827104d0799c153bfb5f867579c0c44652f/js/formats/bbmodel.js#L65
-	# if model.has("textures") and version_less(meta["format_version"], "4.10"):
-	# 	for texture in model["textures"]:
-	# 		if texture.has("relative_path"):
-	# 			texture["relative_path"] = "/" + texture["relative_path"]
-	if model.has("animations") and version_less(meta["format_version"], "5.0"):
-		BBAnimations.migrate_pre_5(model["animations"])
-	return model
+		add_import_option_advanced(
+			TYPE_INT,
+			"bbmodel/embedded_image_handling",
+			2,
+			PROPERTY_HINT_ENUM,
+			"Discard All Textures:0,Extract Textures:1,Embed as Basis Universal:2,Embed as Uncompressed:3",
+			PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED,
+		)
 
 
 func _import_scene(path: String, flags: int, options: Dictionary) -> Object:
@@ -130,173 +220,55 @@ func _import_scene(path: String, flags: int, options: Dictionary) -> Object:
 	if typeof(parsed) != TYPE_DICTIONARY:
 		push_error("BBModel: '%s' is not a valid .bbmodel (JSON) file." % path)
 		return null
-	var model: Dictionary = process_compatibility(parsed)
+	var model = BBState.new(parsed)
 
 	var ctx := Ctx.new()
+	ctx.state = model
 	ctx.scale = 1.0 / float(options.get("bbmodel/pixels_per_unit", 16.0))
+	ctx.nearest = options.get("bbmodel/nearest_filter", true)
 
-	ctx.resolution.x = model["resolution"]["width"]
-	ctx.resolution.y = model["resolution"]["height"]
-	_build_materials(ctx, model.get("textures", []), path.get_base_dir(), options)
-
-	# Index elements by uuid.
-	var elements: Array = model.get("elements", [])
-	for i in elements.size():
-		var el: Variant = elements[i]
-		if el is Dictionary:
-			var uuid := str(el.get("uuid", "idx_%d" % i))
-			ctx.elements[uuid] = el
+	ctx.texture_extraction = options["bbmodel/embedded_image_handling"]
+	ctx.default_material = Tex.new(
+		PlaceholderTexture2D.new(),
+		Tex._make_material(null, "default_material", ctx.nearest, "default", "auto"),
+		ctx.state.resolution,
+	)
+	ctx.base_dir = path.get_base_dir()
+	_load_textures(ctx, model.textures)
 
 	# Root node.
 	var root := Node3D.new()
-	var model_name := str(model.get("name", ""))
+	var model_name := str(model.resource_name)
 	if model_name.is_empty():
 		model_name = path.get_file().get_basename()
 	root.name = model_name
 	ctx.root = root
 
 	# Build hierarchy from the outliner, then add any elements it didn't reference.
-	var outliner: Array = model.get("outliner", [])
+	var outliner: Array = model.outliner
 	_build_children(ctx, root, outliner, Vector3.ZERO)
-	for uuid in ctx.elements:
+	for uuid in ctx.state.elements:
 		if not ctx.used.has(uuid):
-			_build_element(ctx, root, ctx.elements[uuid], Vector3.ZERO)
+			_build_element(ctx, root, ctx.state.elements[uuid], Vector3.ZERO)
 
-	if (flags & IMPORT_ANIMATION) != 0 and model.has("animations"):
+	if (flags & IMPORT_ANIMATION) != 0 and model.animations.size() > 0:
 		var fps := float(options.get("bbmodel/animation_fps", 30.0))
 		BBAnimations.attach_animations(root, ctx.nodes, model["animations"], ctx.scale, fps)
 
 	return root
 
 # --------------------------------------------------------------------------------------
-# Textures / materials
+# Textures
 # --------------------------------------------------------------------------------------
 
 
-func _build_materials(ctx: Ctx, textures: Array, base_dir: String, options: Dictionary) -> void:
-	var nearest: bool = options.get("bbmodel/nearest_filter", true)
-
-	ctx.materials[DEFAULT_MATERIAL] = _make_material(null, "default", nearest, "default", "auto")
-	ctx.uv_sizes[DEFAULT_MATERIAL] = ctx.resolution
-
-	for i in textures.size():
-		var tex: Variant = textures[i]
-		if not (tex is Dictionary):
-			ctx.tex_ids.append("")
-			continue
-		var render_mode = tex.get("render_mode", "default")
-		var render_sides = tex.get("render_sides", "auto")
-		ctx.tex_ids.append(str(tex.get("id", tex.get("uuid", i))))
-
-		var img := _load_texture_image(tex, base_dir)
-		var uv_size := ctx.resolution
-		if tex.has_all(["uv_width", "uv_height"]):
-			uv_size = Vector2(float(tex["uv_width"]), float(tex["uv_height"]))
-		elif img != null:
-			uv_size = Vector2(img.get_size())
-		ctx.uv_sizes[i] = uv_size
-
-		if img != null:
-			var mat_name := str(tex.get("name", "texture_%d" % i)).get_basename()
-			ctx.materials[i] = _make_material(img, mat_name, nearest, render_mode, render_sides)
-		else:
-			push_warning(
-				"BBModel: could not load texture %d ('%s'); using default material."
-				% [i, str(tex.get("name", ""))]
-			)
-			ctx.materials[i] = ctx.materials[DEFAULT_MATERIAL]
-
-
-func _load_mime_image(source: String) -> Image:
-	if not source.begins_with("data:image/"):
-		return null
-	const slash_index = 10
-	var image_type: String = source.substr(slash_index + 1, source.find(";") - slash_index - 1)
-	assert(
-		image_type == "png" or image_type == "webp" or image_type == "jpeg",
-		"Unsupported Image type %s" % image_type,
-	)
-	var encoding: String = source.substr(
-		source.find(";") + 1,
-		source.find(",") - source.find(";") - 1,
-	)
-	if (encoding != "base64"):
-		push_warning("Does not support non base64 encodings")
-		return null
-	var err := OK
-
-	var image: Image = Image.new()
-	var bytes := Marshalls.base64_to_raw(source.substr(source.find(",") + 1))
-	match image_type:
-		"png":
-			err = image.load_png_from_buffer(bytes)
-		"webp":
-			err = image.load_webp_from_buffer(bytes)
-		"jpeg":
-			err = image.load_jpg_from_buffer(bytes)
-		"tga":
-			err = image.load_tga_from_buffer(bytes)
-	if err == OK and not image.is_empty():
-		return image
-	return null
-
-
-func _load_texture_image(tex: Dictionary, base_dir: String) -> Image:
-	# 2. External file next to the .bbmodel.
-	var candidates: Array[String] = []
-	var rel: String = tex.get("relative_path", "")
-	if FileAccess.file_exists(base_dir.path_join(rel)):
-		var img := Image.load_from_file(base_dir.path_join(rel))
-		if img != null and not img.is_empty():
-			return img
-	var abs_path: String = str(tex.get("path", ""))
-	if FileAccess.file_exists(abs_path):
-		var img := Image.load_from_file(abs_path)
-		if img != null and not img.is_empty():
-			return img
-	# 1. Embedded data URI.
-	var src := str(tex.get("source", ""))
-	var embedded_image := _load_mime_image(src)
-	if embedded_image != null:
-		return embedded_image
-
-	return null
-
-
-func _make_material(
-	img: Image,
-	mat_name: String,
-	nearest: bool,
-	render_mode: String,
-	render_sides: String,
-) -> StandardMaterial3D:
-	var mat := StandardMaterial3D.new()
-	mat.resource_name = mat_name
-	if img != null:
-		mat.albedo_texture = ImageTexture.create_from_image(img)
-		match render_mode:
-			"default":
-				mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
-			"emissive":
-				mat.blend_mode = BaseMaterial3D.BLEND_MODE_MIX
-				mat.emission_enabled = true
-				mat.emission = Color.WHITE
-			"additive":
-				mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
-		match render_sides:
-			"auto":
-				mat.cull_mode = BaseMaterial3D.CULL_BACK
-			"front":
-				mat.cull_mode = BaseMaterial3D.CULL_BACK
-				push_warning("do not currently support emissive textures")
-			"double":
-				mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-
-		if nearest:
-			mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
-	else:
-		mat.albedo_color = Color(0.8, 0.8, 0.8)
-	return mat
+func _load_textures(ctx: Ctx, textures: Array) -> void:
+	ctx.textures.resize(textures.size())
+	var i := 0
+	for texture in textures:
+		ctx.textures[i] = Tex.from_bbtexture(ctx, texture)
+		# ctx.textures[str(texture["id"]).to_int()] = Tex.from_bbtexture(ctx, texture)
+		i += 1
 
 # --------------------------------------------------------------------------------------
 # Scene tree construction
@@ -306,7 +278,7 @@ func _make_material(
 func _build_children(ctx: Ctx, parent: Node3D, entries: Array, parent_origin: Vector3) -> void:
 	for entry in entries:
 		if typeof(entry) == TYPE_STRING:
-			var el: Variant = ctx.elements.get(entry)
+			var el: Variant = ctx.state.elements.get(entry)
 			if el == null:
 				continue
 			ctx.used[entry] = true
@@ -316,16 +288,48 @@ func _build_children(ctx: Ctx, parent: Node3D, entries: Array, parent_origin: Ve
 
 
 func _build_group(ctx: Ctx, parent: Node3D, group: Dictionary, parent_origin: Vector3) -> void:
-	if group.get("export", true) == false:
+	var real_group = ctx.state.groups[group["uuid"]]
+	if not real_group.export:
 		return
-	var origin := _to_vector_3(group.get("origin"))
+	var origin := _to_vector_3(real_group.origin)
 	var node := Node3D.new()
-	node.name = str(group.get("name", "Group"))
+	node.name = real_group.name
 	_attach(ctx, parent, node)
-	ctx.nodes[str(group.get("uuid", ""))] = node
-	_apply_transform(ctx, node, origin - parent_origin, _to_vector_3(group.get("rotation")))
-	node.visible = bool(group.get("visibility", true))
+	ctx.nodes[group.get("uuid", "")] = node
+	_apply_transform(ctx, node, origin - parent_origin, real_group.rotation)
+	node.visible = real_group.visibility
 	_build_children(ctx, node, group.get("children", []), origin)
+
+
+func Billboard(ctx: Ctx, element: Dictionary) -> Node3D:
+	assert(element.get("type", "") == "billboard")
+	var billboard: Sprite3D = Sprite3D.new()
+
+	var uv := _to_vector_4(element["faces"]["front"]["uv"])
+	var region = Rect2(Vector2(uv.x, uv.y), Vector2(uv.z, uv.w) - Vector2(uv.x, uv.y))
+	billboard.region_enabled = true
+	billboard.region_rect = region
+	billboard.pixel_size = ctx.scale
+	billboard.position = _to_vector_3(element.get("position"))
+	billboard.name = element.get("name", "billboard")
+	match element["facing_mode"]:
+		"lookat_y", "rotate_y":
+			billboard.billboard = BaseMaterial3D.BILLBOARD_FIXED_Y
+		"rotate", "lookat":
+			billboard.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+
+	if ctx.nearest:
+		billboard.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	var mat: Tex
+	var key = element["faces"]["front"]["texture"]
+	match key:
+		true, null:
+			billboard.texture = ctx.default_material.texture
+		false: # skip face
+			pass
+		_:
+			billboard.texture = ctx.textures[key].texture
+	return billboard
 
 
 func _build_element(ctx: Ctx, parent: Node3D, el: Dictionary, parent_origin: Vector3) -> void:
@@ -337,14 +341,14 @@ func _build_element(ctx: Ctx, parent: Node3D, el: Dictionary, parent_origin: Vec
 	match type:
 		"cube", "mesh":
 			var origin := _to_vector_3(el.get("origin"))
-			var mesh: Mesh
+			var mesh: ImporterMesh
 			if type == "cube":
 				mesh = _build_cube_mesh(ctx, el, origin, el_name)
 			else:
 				mesh = _build_mesh_element(ctx, el, el_name)
 			if mesh == null:
 				return
-			var node := MeshInstance3D.new()
+			var node := ImporterMeshInstance3D.new()
 			node.name = el_name
 			node.mesh = mesh
 			_attach(ctx, parent, node)
@@ -356,6 +360,10 @@ func _build_element(ctx: Ctx, parent: Node3D, el: Dictionary, parent_origin: Vec
 			marker.name = el_name
 			_attach(ctx, parent, marker)
 			_apply_transform(ctx, marker, pos - parent_origin, _to_vector_3(el.get("rotation")))
+		"billboard":
+			var billboard := Billboard(ctx, el)
+			_attach(ctx, parent, billboard)
+			_apply_transform(ctx, billboard, billboard.position - parent_origin, Vector3(0, 0, 0))
 		_:
 			push_warning(
 				"BBModel: skipping unsupported element type '%s' ('%s')." % [type, el_name]
@@ -377,7 +385,7 @@ func _apply_transform(ctx: Ctx, node: Node3D, offset: Vector3, rot_deg: Vector3)
 # --------------------------------------------------------------------------------------
 
 
-func _build_cube_mesh(ctx: Ctx, el: Dictionary, origin: Vector3, mesh_name: String) -> Mesh:
+func _build_cube_mesh(ctx: Ctx, el: Dictionary, origin: Vector3, mesh_name: String) -> ImporterMesh:
 	const FACE_NAMES: Array[String] = ["north", "east", "south", "west", "up", "down"]
 	const FACE_NORMALS := {
 		"north": Vector3(0, 0, -1),
@@ -447,15 +455,21 @@ func _build_cube_mesh(ctx: Ctx, el: Dictionary, origin: Vector3, mesh_name: Stri
 		if typeof(faces.get(face_name)) != TYPE_DICTIONARY:
 			continue
 		var face: Dictionary = faces[face_name]
-		var key := _material_key(ctx, face)
-		if key == SKIP_FACE:
-			continue
+		var mat: Tex
+		var key = faces.get("texture", null)
+		match key:
+			true, null:
+				mat = ctx.default_material
+			false: # skip face
+				continue
+			_:
+				mat = ctx.textures[str(key).to_int()]
 
 		var raw_uv: Variant = face.get("uv")
 		var rect: Array = raw_uv if raw_uv is Array else []
 		if rect.size() < 4:
 			rect = box_rects.get(face_name, [0, 0, 0, 0])
-		var uvs := _face_uvs(rect, int(face.get("rotation", 0)), _uv_size(ctx, key))
+		var uvs := _face_uvs(rect, int(face.get("rotation", 0)), mat.uv_size)
 		var pts: Array = corners[face_name]
 		_add_quad(_get_surface(surfaces, key), pts, uvs, FACE_NORMALS[face_name], origin, ctx.scale)
 
@@ -512,7 +526,7 @@ func _add_quad(
 # --------------------------------------------------------------------------------------
 
 
-func _build_mesh_element(ctx: Ctx, el: Dictionary, mesh_name: String) -> Mesh:
+func _build_mesh_element(ctx: Ctx, el: Dictionary, mesh_name: String) -> ImporterMesh:
 	var verts: Dictionary = el.get("vertices", { })
 	var faces: Dictionary = el.get("faces", { })
 
@@ -526,9 +540,15 @@ func _build_mesh_element(ctx: Ctx, el: Dictionary, mesh_name: String) -> Mesh:
 		if typeof(faces[fid]) != TYPE_DICTIONARY:
 			continue
 		var face: Dictionary = faces[fid]
-		var key := _material_key(ctx, face)
-		if key == SKIP_FACE:
-			continue
+		var key = face.get("texture", null)
+		var mat: Tex
+		match key:
+			true, null:
+				mat = ctx.default_material
+			false: # skip face
+				continue
+			_:
+				mat = ctx.textures[str(key).to_int()]
 
 		var raw_ids: Array = face.get("vertices", [])
 		var ids: Array = raw_ids.filter(
@@ -546,7 +566,6 @@ func _build_mesh_element(ctx: Ctx, el: Dictionary, mesh_name: String) -> Mesh:
 		var normal := (b - a).cross(c - a).normalized()
 		ids.reverse()
 
-		var uv_size := _uv_size(ctx, key)
 		var uv_dict: Dictionary = face.get("uv", { }) if face.get("uv") is Dictionary else { }
 		var st := _get_surface(surfaces, key)
 		for i in range(1, ids.size() - 1):
@@ -554,12 +573,13 @@ func _build_mesh_element(ctx: Ctx, el: Dictionary, mesh_name: String) -> Mesh:
 				var uv_arr: Variant = uv_dict.get(id)
 				var uv := Vector2.ZERO
 				if uv_arr is Array and uv_arr.size() >= 2:
-					uv = Vector2(float(uv_arr[0]), float(uv_arr[1])) / uv_size
+					uv = Vector2(float(uv_arr[0]), float(uv_arr[1])) / mat.uv_size
 				var p: Vector3 = pos[id]
 				st.set_normal(normal)
 				st.set_uv(uv)
 				st.add_vertex(p * ctx.scale)
-
+		if (el["shading"] == "smooth"):
+			st.generate_normals()
 	return _commit(ctx, surfaces, mesh_name)
 
 
@@ -600,27 +620,7 @@ func _sort_vertices(ids: Array, pos: Dictionary) -> Array:
 # --------------------------------------------------------------------------------------
 
 
-func _material_key(ctx: Ctx, face: Dictionary) -> int:
-	if not face.has("texture"):
-		return DEFAULT_MATERIAL
-	var t: Variant = face["texture"]
-	if t == null:
-		return DEFAULT_MATERIAL
-	if typeof(t) == TYPE_BOOL:
-		return DEFAULT_MATERIAL if t else SKIP_FACE # `false` = face disabled in Blockbench
-	if typeof(t) == TYPE_STRING:
-		var idx := ctx.tex_ids.find(t)
-		return idx if idx != -1 else DEFAULT_MATERIAL
-	var i := int(t)
-	return i if ctx.materials.has(i) else DEFAULT_MATERIAL
-
-
-func _uv_size(ctx: Ctx, key: int) -> Vector2:
-	var s: Vector2 = ctx.uv_sizes.get(key, ctx.resolution)
-	return Vector2(maxf(s.x, 1.0), maxf(s.y, 1.0))
-
-
-func _get_surface(surfaces: Dictionary, key: int) -> SurfaceTool:
+static func _get_surface(surfaces: Dictionary, key: int) -> SurfaceTool:
 	if not surfaces.has(key):
 		var st := SurfaceTool.new()
 		st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -628,7 +628,7 @@ func _get_surface(surfaces: Dictionary, key: int) -> SurfaceTool:
 	return surfaces[key]
 
 
-func _commit(ctx: Ctx, surfaces: Dictionary, mesh_name: String) -> Mesh:
+static func _commit(ctx: Ctx, surfaces: Dictionary, mesh_name: String) -> ImporterMesh:
 	if surfaces.is_empty():
 		return null
 	var mesh := ArrayMesh.new()
@@ -637,15 +637,34 @@ func _commit(ctx: Ctx, surfaces: Dictionary, mesh_name: String) -> Mesh:
 	keys.sort()
 	for key in keys:
 		var st: SurfaceTool = surfaces[key]
-		st.set_material(ctx.materials[key])
+		st.set_material(ctx.textures[key].material)
+		st.index()
 		st.commit(mesh)
-	return mesh
+	return ImporterMesh.from_mesh(mesh)
 
 
-func _to_vector_3(v: Variant, default: Vector3 = Vector3(0, 0, 0)) -> Vector3:
+static func _to_vector_3(v: Variant, default: Vector3 = Vector3(0, 0, 0)) -> Vector3:
 	if v is Vector3:
 		return v
 	if v is Array:
 		assert(v.size() == 3)
 		return Vector3(float(v[0]), float(v[1]), float(v[2]))
+	return default
+
+
+static func _to_vector_4(v: Variant, default: Vector4 = Vector4(0, 0, 0, 0)) -> Vector4:
+	if v is Vector4:
+		return v
+	if v is Array:
+		assert(v.size() == 4)
+		return Vector4(float(v[0]), float(v[1]), float(v[2]), float(v[3]))
+	return default
+
+
+static func to_vector_2(v: Variant, default: Vector2 = Vector2(0, 0)) -> Vector2:
+	if v is Vector2:
+		return v
+	if v is Array:
+		assert(v.size() == 2)
+		return Vector2(float(v[0]), float(v[1]))
 	return default
