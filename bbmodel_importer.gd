@@ -456,7 +456,7 @@ func _build_cube_mesh(ctx: Ctx, el: Dictionary, origin: Vector3, mesh_name: Stri
 			continue
 		var face: Dictionary = faces[face_name]
 		var mat: Tex
-		var key = faces.get("texture", null)
+		var key = face.get("texture", null)
 		match key:
 			true, null:
 				mat = ctx.default_material
